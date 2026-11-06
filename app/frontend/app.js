@@ -67,6 +67,7 @@ const state = {
     includeOpenTabs: true,
     includeHistory: false,
     includeCookies: false,
+    clearBeforeImport: false,
     excludedSpaces: [],
   },
   steps: [],
@@ -478,12 +479,14 @@ function renderPreview(p) {
   for (const s of p.spaces) list.appendChild(makeSpaceRow(s));
 
   const toggles = $("toggles"); clear(toggles);
+  toggles.appendChild(makeToggle("clearBeforeImport", "Clear Zen before importing",
+    "Backs up, then clears all spaces, tabs, containers, bookmarks, history, cookies and favicons in the selected Zen profile. Passwords, extensions and settings stay."));
   toggles.appendChild(makeToggle("includeOpenTabs", "Open tabs",
                                  `Migrate ${p.openTotal} open tabs`));
   toggles.appendChild(makeToggle("includeHistory", "Browsing history",
                                  `Copy ~${formatRows(p.historyRowsEstimate)} history rows`));
   toggles.appendChild(makeToggle("includeCookies", "Cookies & login state",
-                                 `Copy ~${formatRows(p.cookiesEstimate)} cookies (Keychain prompt)`));
+                                 `Enable to transfer logins from ~${formatRows(p.cookiesEstimate)} cookies; profiles stay separate (Keychain prompt)`));
   toggles.appendChild(makeToggle("foldersCollapsed", "Collapse folders",
                                  "Imported folders start collapsed"));
 }
@@ -559,10 +562,21 @@ function toggleSpaceExcluded(name, isExcluded, row) {
 function makeToggle(key, label, desc) {
   const node = el("div", {
     class: "toggle",
+    role: "switch",
+    tabindex: "0",
+    "aria-label": label + ". " + desc,
+    "aria-checked": state.options[key] ? "true" : "false",
     dataset: {key, on: state.options[key] ? "true" : "false"},
     onclick: () => {
       state.options[key] = !state.options[key];
       node.dataset.on = state.options[key] ? "true" : "false";
+      node.setAttribute("aria-checked", state.options[key] ? "true" : "false");
+    },
+    onkeydown: (ev) => {
+      if (ev.key === " " || ev.key === "Enter") {
+        ev.preventDefault();
+        node.click();
+      }
     },
   }, [
     el("div", {class: "label-stack"}, [
@@ -591,6 +605,9 @@ function svgChild(parent, tag, attrs) {
 }
 
 const STEP_ICON_BUILDERS = {
+  clear: (s) => {
+    svgChild(s, "path", {d: "M4 5 L14 5 M7 5 L7 3 L11 3 L11 5 M5 5 L6 15 L12 15 L13 5"});
+  },
   extract: (s) => {
     svgChild(s, "path", {d: "M5 2 L11 2 L14 5 L14 16 L4 16 L4 2 Z"});
     svgChild(s, "path", {d: "M11 2 L11 5 L14 5"});
@@ -655,8 +672,10 @@ function stepSubtitle(step) {
       return isArc
         ? "Reading Arc's StorableSidebar.json"
         : `Reading ${src} bookmarks and profile data`;
+    case "clear":
+      return "Saving a restorable backup, then clearing the selected Zen profile's import data";
     case "containers":
-      return "Setting up cookie-isolated containers per space";
+      return "Setting up containers for source profiles";
     case "sessions":
       return "Writing spaces, pinned tabs and folders to zen-sessions.jsonlz4";
     case "bookmarks":
@@ -793,6 +812,7 @@ function handleEvent(ev) {
     }
   } else if (ev.kind === "step_error") {
     state.stepStates[ev.step] = "error";
+    state.logLines.push({kind: "step_error", message: ev.detail || ev.message, step: ev.step});
   } else {
     state.logLines.push({kind: ev.kind, message: ev.message, step: ev.step});
     if (state.logLines.length > 500) state.logLines.shift();
@@ -810,6 +830,7 @@ function handleEvent(ev) {
 
 function visibleSteps() {
   return state.steps.filter(s => {
+    if (s === "clear") return state.options.clearBeforeImport;
     if (s === "history")   return state.options.includeHistory;
     if (s === "cookies")   return state.options.includeCookies;
     if (s === "containers" || s === "sessions") return state.options.includeWorkspaces || state.options.includePinnedTabs;
@@ -875,6 +896,7 @@ function makeActiveRow(step) {
 
 function stepSummaryText(step, s) {
   if (!s) return "";
+  if (step === "clear") return "Backup saved · cleared";
   if (step === "extract")    return `${s.spaces ?? "?"} spaces · ${s.pinned ?? "?"} tabs`;
   if (step === "containers") return `${s.created_or_reused ?? "?"} containers`;
   if (step === "favicons") {
@@ -882,7 +904,7 @@ function stepSummaryText(step, s) {
     return `${formatRows(db.imported ?? 0)} icons · ${formatRows(sess.updated ?? 0)} tabs inlined`;
   }
   if (step === "history") return `${formatRows(s.places_added ?? 0)} places · ${formatRows(s.visits_added ?? 0)} visits`;
-  if (step === "cookies") return `${formatRows(s.imported ?? 0)} imported · ${formatRows(s.merged ?? 0)} merged`;
+  if (step === "cookies") return `${formatRows(s.imported ?? 0)} imported · ${formatRows(s.merged ?? 0)} merged · ${formatRows(s.skipped ?? 0)} skipped`;
   if (step === "sessions") {
     if (s.pinned == null && s.open == null) return s.ok ? "ok" : "";
     const parts = [];
@@ -936,11 +958,15 @@ async function finishOk(finalState) {
     summary.title = "";
     summary.onclick = null;
   } else {
-    headline.textContent = "All set.";
+    const errors = (finalState && finalState.errors) || [];
+    headline.textContent = errors.length ? "Migration needs attention." : "All set.";
     const ext = state.stepSummaries.extract || {};
     summary.textContent = ext.pinned
       ? `${ext.pinned} pinned tabs across ${ext.spaces} spaces. Backups saved next to your Zen profile.`
       : `Backups saved next to your Zen profile.`;
+    if (errors.length) summary.textContent = errors.join(" ");
+    else if (!state.options.includeCookies) summary.textContent += " Cookies & login state were not selected; sites will need login.";
+    else summary.textContent += " Login state imported where supported; some sites may still require login.";
     summary.style.cursor = "";
     summary.title = "";
     summary.onclick = null;
@@ -1121,6 +1147,7 @@ function currentOptionsJson() {
     includeOpenTabs: state.options.includeOpenTabs,
     includeHistory: state.options.includeHistory,
     includeCookies: state.options.includeCookies,
+    clearBeforeImport: state.options.clearBeforeImport,
   });
 }
 

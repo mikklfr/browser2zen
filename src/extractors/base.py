@@ -121,11 +121,13 @@ class SpaceRecord:
     # bookmark-only sources (Arc/Firefox/Safari) behave exactly as before.
     bookmarks: list[TabRecord] | None = None
     bookmark_folders: list[FolderRecord] | None = None
+    source_profile: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "space_id": self.space_id,
             "space_name": self.space_name,
+            "source_profile": self.source_profile,
             "pinned_tabs": [t.to_dict() for t in self.pinned_tabs],
             "open_tabs": [t.to_dict() for t in self.open_tabs],
             "folders": [f.to_dict() for f in self.folders],
@@ -170,6 +172,7 @@ class ExportData:
             spaces_out.append({
                 "space_id": s.space_id,
                 "space_name": s.space_name,
+                "source_profile": s.source_profile,
                 "icon": s.icon,
                 "color": s.color,
                 "total_pinned_tabs": len(s.pinned_tabs),

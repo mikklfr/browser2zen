@@ -123,6 +123,15 @@ your profile, then click **Recheck** in browser2zen and continue.
 
 ## What gets migrated
 
+For a fresh import, enable **Clear Zen before importing** on the preview
+screen. This clears all spaces, tabs, containers, bookmarks, history,
+cookies and favicons in the selected Zen profile, including data unrelated
+to earlier imports. Saved passwords, extensions, settings and other website
+storage stay. Zen must be closed. The app first saves a
+`before-import-<timestamp>.zenbackup` beside the profile's database files;
+if backup fails, nothing is cleared. To undo, use **Backup or restore Zen**
+and select that archive. The option is off by default.
+
 | | |
 | --- | --- |
 | **Spaces** | Each source-browser space becomes a Zen workspace, with its emoji icon and colour theme. |
@@ -133,7 +142,7 @@ your profile, then click **Recheck** in browser2zen and continue.
 | **Bookmarks** | Pinned tabs are also mirrored to Firefox bookmarks as a backup. |
 | **Favicons** | The source's cached icons are inlined so tabs show their icons immediately, with no waiting for refetch. |
 | **History** | Optional. Browsing history with original timestamps is copied over. |
-| **Login state** | Optional. Chromium-format cookies are decrypted (via macOS Keychain or Windows DPAPI, depending on platform) and re-encrypted into Zen so you stay logged in to Gmail, Twitter, and the rest. |
+| **Login state** | Opt in with **Cookies & login state**. Supported Chromium cookies are decrypted through macOS Keychain or Windows DPAPI and converted into the matching Zen container. Some sites still require login; failed or unsupported cookies are reported. |
 
 Every step writes a timestamped backup beside your Zen profile before
 it changes anything, and source-browser data is read-only. The Backups screen
@@ -225,13 +234,24 @@ you're hacking on this:
   `image` data URI in `zen-sessions.jsonlz4`**, not from
   `favicons.sqlite`. Writing only the SQLite store leaves the sidebar
   blank.
-- **`moz_cookies.expiry` switched from seconds to milliseconds around
-  Firefox 108.** Storing seconds makes Firefox treat every cookie as
-  expired in 1970 and purge them all on next startup.
-- **Cookies in container tabs are isolated.** Cookies imported with
-  empty `originAttributes` are invisible to per-space containers, so
-  each cookie is also written under `^userContextId=N` for every
-  container the migration creates.
+- **`moz_cookies.expiry` uses milliseconds from schema 16 onward.**
+  The Chromium writer checks the destination schema and handles older
+  second-based schemas without requiring the newer `updateTime` column.
+- **Arc profile sharing is preserved.** Each Arc profile gets a dedicated
+  Zen container; its spaces share that container. Workspace defaults and
+  all restored tab types use the same identity. Cookies are written only
+  to their profile's container, keeping different accounts separate.
+- **Reruns repair identifiable earlier imports.** The old setup guide and
+  matching URLs identify legacy workspaces; future reruns use stable IDs
+  in `.browser2zen-identities.json`. Unrelated Zen cookies are preserved.
+  Cookies already mixed by earlier versions cannot reliably be attributed
+  to their source; the repaired migration uses fresh dedicated containers.
+- **Login transfer has limits.** HTTP(S) partitioned cookies retain their
+  top-level-site scope and profile container. Unsupported partition scopes
+  are reported and skipped; localStorage, sessionStorage and IndexedDB are
+  not converted. Session cookies receive the existing 30-day migration
+  lifetime. Containers preserve website sessions, not browser-wide
+  history/extension/settings isolation.
 
 The GUI in `app/` wraps the same importer classes from `src/` without
 modifying them. Architecture details are in [CLAUDE.md](./CLAUDE.md).

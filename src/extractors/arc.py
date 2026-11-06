@@ -123,6 +123,7 @@ class ArcExtractor(BrowserExtractor):
                 folders=folders,
                 icon=s.icon,
                 color=s.color,
+                source_profile=s.source_profile,
             ))
         return ExportData(source=self.name, spaces=out_spaces)
 

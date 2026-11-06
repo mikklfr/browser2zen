@@ -8,11 +8,13 @@ as pinned tabs in the correct spaces, not as bookmarks.
 
 import json
 import logging
-import uuid
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from migration_state import backup_file, container_for, load_state, profile_key, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -91,74 +93,50 @@ class ZenSpaceImporter:
             logger.error(f"Failed to load containers: {e}")
             return {}
 
-    def create_containers_for_spaces(self, arc_spaces: list) -> dict[str, int]:
-        """Create Zen containers for Arc spaces and return space_name -> container_id mapping."""
-        container_config = self.load_existing_containers()
-        if not container_config:
-            return {}
-
-        # Get existing container names to avoid duplicates
-        existing_names = set()
-        for identity in container_config.get("identities", []):
-            name = identity.get("name") or identity.get("l10nId", "").replace("user-context-", "")
-            existing_names.add(name.lower())
-
-        space_to_container = {}
-        last_context_id = container_config.get("lastUserContextId", 1)
-
-        icon_index = 0
-        color_index = 0
-
+    def create_containers_for_spaces(self, arc_spaces: list, source: str = "arc") -> dict[str, int]:
+        """One owned container per source profile; never adopt identities by name."""
+        config = self.load_existing_containers()
+        if not config:
+            raise ValueError("Cannot read containers.json")
+        state = load_state(self.zen_profile.path)
+        identities = config.setdefault("identities", [])
+        public_ids = {i["userContextId"] for i in identities if i.get("public")}
+        last_id = max([config.get("lastUserContextId", 0),
+                       *[i["userContextId"] for i in identities if i["userContextId"] < 1_000_000]])
+        mappings = {}
         for space in arc_spaces:
-            space_name = space['space_name']
-
-            # Check if container already exists
-            existing_container = None
-            for identity in container_config.get("identities", []):
-                identity_name = identity.get("name") or identity.get("l10nId", "").replace("user-context-", "")
-                if identity_name.lower() == space_name.lower():
-                    existing_container = identity
-                    break
-
-            if existing_container:
-                space_to_container[space_name] = existing_container["userContextId"]
-                logger.info(f"  📁 Using existing container: {space_name} -> {existing_container['userContextId']}")
-            else:
-                # Create new container
-                last_context_id += 1
-
-                # Select icon and color cyclically
-                icon = self.CONTAINER_ICONS[icon_index % len(self.CONTAINER_ICONS)]
-                color = self.CONTAINER_COLORS[color_index % len(self.CONTAINER_COLORS)]
-                icon_index += 1
-                color_index += 1
-
-                new_container = {
-                    "icon": icon,
-                    "color": color,
-                    "public": True,
-                    "userContextId": last_context_id,
-                    "name": space_name
-                }
-
-                container_config["identities"].append(new_container)
-                space_to_container[space_name] = last_context_id
-
-                logger.info(f"  ✅ Created container: {space_name} -> {last_context_id} ({icon}, {color})")
-
-        # Update lastUserContextId
-        container_config["lastUserContextId"] = last_context_id
-
-        # Save updated container configuration
-        self.save_containers(container_config)
-
-        return space_to_container
+            key = profile_key(source, space)
+            cid = state["profiles"].get(key)
+            if cid not in public_ids:
+                last_id += 1
+                cid = last_id
+                identities.append({
+                    "userContextId": cid, "public": True,
+                    "name": f"{source.title()} · {space.get('source_profile') or space['space_name']}",
+                    "icon": self.CONTAINER_ICONS[(cid - 1) % len(self.CONTAINER_ICONS)],
+                    "color": self.CONTAINER_COLORS[(cid - 1) % len(self.CONTAINER_COLORS)],
+                })
+                public_ids.add(cid)
+                state["profiles"][key] = cid
+            mappings[space["space_id"]] = cid
+        # Keep unique display-name aliases for older writer/CLI callers.
+        for space in arc_spaces:
+            if sum(s["space_name"] == space["space_name"] for s in arc_spaces) == 1:
+                mappings.setdefault(space["space_name"], mappings[space["space_id"]])
+        config["lastUserContextId"] = last_id
+        if not self.save_containers(config):
+            raise OSError("Cannot save containers.json")
+        save_state(self.zen_profile.path, state)
+        return mappings
 
     def save_containers(self, container_config: dict) -> bool:
         """Save container configuration to containers.json."""
         try:
-            with open(self.containers_file, 'w') as f:
+            backup_file(self.containers_file)
+            temporary = self.containers_file.with_suffix(".tmp")
+            with open(temporary, 'w') as f:
                 json.dump(container_config, f, separators=(',', ':'))
+            temporary.replace(self.containers_file)
             logger.info("✅ Updated containers.json")
             return True
         except Exception as e:
@@ -184,15 +162,21 @@ class ZenSpaceImporter:
             if active_workspace_id:
                 workspace_prefs.append(f'user_pref("zen.workspaces.active", "{active_workspace_id}");')
 
-            # Add missing prefs
+            backup_file(self.prefs_file)
+            # Update existing prefs too, so an old false value cannot defeat routing.
             for pref in workspace_prefs:
                 pref_name = pref.split('"')[1]
-                if pref_name not in prefs_content:
+                pattern = r'user_pref\("' + re.escape(pref_name) + r'",[^\n]*\);'
+                if re.search(pattern, prefs_content):
+                    prefs_content = re.sub(pattern, lambda _: pref, prefs_content)
+                else:
                     prefs_content += "\n" + pref
 
             # Write back
-            with open(self.prefs_file, 'w') as f:
+            temporary = self.prefs_file.with_suffix(".tmp")
+            with open(temporary, 'w') as f:
                 f.write(prefs_content)
+            temporary.replace(self.prefs_file)
 
             logger.info("✅ Updated workspace preferences")
             return True
@@ -222,27 +206,14 @@ class ZenSpaceImporter:
                 return {}
 
             # Create containers for spaces
-            space_to_container = self.create_containers_for_spaces(arc_spaces)
+            space_to_container = self.create_containers_for_spaces(arc_spaces, export_data.get("source", "arc"))
 
             if not space_to_container:
                 logger.error("Failed to create any containers")
                 return {}
 
-            # Update workspace preferences
-            # Generate a UUID for the active workspace (first space)
-            if arc_spaces:
-                active_uuid = str(uuid.uuid4())
-                self.update_prefs_for_workspaces(active_uuid)
-
-            logger.info(f"✅ Successfully created {len(space_to_container)} Zen containers")
-
-            # Log the mapping
-            for space_name, container_id in space_to_container.items():
-                logger.info(f"  📁 {space_name} -> Container ID {container_id}")
-
-            # Create a workspaces.json guide file for the user
-            self.create_workspaces_guide(space_to_container, arc_spaces)
-
+            if not self.update_prefs_for_workspaces():
+                raise OSError("Cannot update workspace preferences")
             return space_to_container
 
         except Exception as e:
@@ -271,7 +242,7 @@ class ZenSpaceImporter:
             # Add workspace creation instructions
             for space in arc_spaces:
                 space_name = space['space_name']
-                container_id = space_to_container.get(space_name)
+                container_id = container_for(space_to_container, space)
                 pinned_tab_count = len(space.get('pinned_tabs', []))
 
                 workspace_info = {

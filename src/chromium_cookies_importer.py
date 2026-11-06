@@ -19,9 +19,9 @@ Supports macOS and Windows:
   ``v10`` use AES-256-GCM (12-byte nonce + ciphertext + 16-byte
   authentication tag).
 
-The Firefox-side write (``moz_cookies`` insert, container duplication,
-ms-vs-seconds expiry handling) is identical across platforms. Re-running
-merges new cookies without duplicating existing ones.
+The Firefox-side write routes each source profile only to its mapped
+container and uses schema-specific expiry units. Re-running merges cookies
+without mixing accounts or touching the default context.
 
 The orchestrator passes the source's cookie paths + matching Keychain
 service/account + Local State path via the importer's kwargs so the
@@ -31,6 +31,9 @@ same code serves every Chromium browser.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -41,8 +44,10 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import quote_plus, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +116,9 @@ def _decrypt_v10_cbc(blob: bytes, key: bytes) -> bytes | None:
     decryptor = cipher.decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     pad = padded[-1] if padded else 0
-    if 0 < pad <= 16 and padded.endswith(bytes([pad]) * pad):
-        padded = padded[:-pad]
-    return padded
+    if not (0 < pad <= 16 and padded.endswith(bytes([pad]) * pad)):
+        return None
+    return padded[:-pad]
 
 
 # ---------- Windows DPAPI master-key unwrap ----------
@@ -255,25 +260,50 @@ def _decrypt_v10_gcm(blob: bytes, key: bytes) -> bytes | None:
         return None
 
 
-def _strip_host_hash(plaintext: bytes) -> bytes:
-    """Some Chromium builds prefix the plaintext with a 32-byte SHA-256(host) tag.
-
-    We don't know up-front which builds use it. Heuristic: if the first 32 bytes
-    are non-printable and the remainder is printable, drop the tag.
-    """
-    if len(plaintext) < 33:
+def _strip_host_hash(plaintext: bytes, host: bytes, version: int) -> bytes | None:
+    """Chromium DB v24 binds each encrypted value to its exact host."""
+    if version < 24:
         return plaintext
-    head, tail = plaintext[:32], plaintext[32:]
-    if any(b < 0x20 or b > 0x7E for b in head) and all(0x09 <= b <= 0x7E or b == 0x0A for b in tail):
-        return tail
-    return plaintext
+    digest = hashlib.sha256(host).digest()
+    if len(plaintext) < 32 or not hmac.compare_digest(plaintext[:32], digest):
+        return None
+    return plaintext[32:]
 
 
 # Chromium SameSite (samesite enum in net/cookies/cookie_constants.h):
 #   -1 UNSPECIFIED, 0 NO_RESTRICTION, 1 LAX, 2 STRICT
 # Firefox sameSite (in nsICookie.idl):
-#   0 SAMESITE_NONE, 1 SAMESITE_LAX, 2 SAMESITE_STRICT, 3 SAMESITE_UNSET
-_SAMESITE_MAP = {-1: 3, 0: 0, 1: 1, 2: 2}
+#   0 SAMESITE_NONE, 1 SAMESITE_LAX, 2 SAMESITE_STRICT, 256 SAMESITE_UNSET
+_SAMESITE_MAP = {-1: 256, 0: 0, 1: 1, 2: 2}
+
+
+def _partition_key(site: str, host: str, source_scheme: int, cross_site: int) -> str:
+    """Translate Chromium's schemeful site, retaining Gecko's ancestor boundary.
+
+    Gecko's `f` bit means same-site with the top level through a cross-site
+    ancestor. Chromium's bit also includes ordinary third-party frames.
+    """
+    if not site:
+        return ""
+    parsed = urlsplit(site)
+    domain = parsed.hostname
+    if (parsed.scheme not in ("http", "https") or not domain or parsed.username is not None
+            or parsed.password is not None or parsed.port is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+        raise ValueError("unsupported_partition_site")
+    if ":" in domain:
+        domain = f"[{ipaddress.IPv6Address(domain)}]"
+    elif any(c not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for c in domain):
+        raise ValueError("unsupported_partition_site")
+    cookie_host = host.lower().lstrip(".")
+    same_domain = cookie_host == domain or cookie_host.endswith("." + domain)
+    scheme = {1: "http", 2: "https"}.get(source_scheme)
+    if cross_site not in (0, 1) or (same_domain and scheme is None):
+        raise ValueError("unknown_partition_ancestor")
+    foreign = cross_site and same_domain and scheme == parsed.scheme
+    key = f"({parsed.scheme},{domain}{',f' if foreign else ''})"
+    # OriginAttributes::CreateSuffix sanitizes colons before URLParams encoding.
+    return quote_plus(key.replace(":", "+"), safe="")
 
 
 def _cookie_dbs_default() -> list[Path]:
@@ -322,6 +352,7 @@ class CookiesImporter:
         keychain_service: str = "Arc Safe Storage",
         keychain_account: str = "Arc",
         local_state_paths: list[Path] | None = None,
+        cookie_routes: dict[Path, list[int]] | None = None,
     ):
         # ``cookie_dbs`` injects per-browser cookie SQLite paths; the
         # other three knobs let any Chromium browser (Chrome/Edge/Brave)
@@ -338,17 +369,16 @@ class CookiesImporter:
         self._local_state_paths: list[Path] | None = (
             [Path(p) for p in local_state_paths] if local_state_paths is not None else None
         )
+        self.cookie_routes = ({Path(p): ids for p, ids in cookie_routes.items()}
+                              if cookie_routes is not None else None)
         self._tempdir: Path | None = None
 
     def _snapshot(self, src: Path) -> Path:
         if self._tempdir is None:
             self._tempdir = Path(tempfile.mkdtemp(prefix="browser2zen_cookies_"))
-        dest = self._tempdir / f"{src.parent.name}_{src.name}.db"
-        shutil.copy2(src, dest)
-        for suffix in ("-wal", "-shm", "-journal"):
-            sib = src.with_name(src.name + suffix)
-            if sib.exists():
-                shutil.copy2(sib, dest.with_name(dest.name + suffix))
+        dest = self._tempdir / f"{len(list(self._tempdir.iterdir()))}.sqlite"
+        with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as source, closing(sqlite3.connect(dest)) as target:
+            source.backup(target)
         return dest
 
     def _cleanup(self) -> None:
@@ -361,9 +391,12 @@ class CookiesImporter:
         rows: Iterable[sqlite3.Row],
         key: bytes,
         decrypt_fn: Callable[[bytes, bytes], bytes | None],
+        version: int = 0,
+        stats: dict | None = None,
     ) -> Iterable[dict]:
         decrypt_fail = 0
         decoded = 0
+        stats = stats if stats is not None else {"failed": 0, "unsupported": 0}
 
         def s(b) -> str:
             if b is None:
@@ -376,29 +409,44 @@ class CookiesImporter:
                 return b.decode("latin-1", errors="replace")
 
         for row in rows:
+            try:
+                partition = _partition_key(
+                    s(row["top_frame_site_key"]) if "top_frame_site_key" in row.keys() else "",
+                    s(row["host_key"]),
+                    row["source_scheme"] if "source_scheme" in row.keys() else 0,
+                    row["has_cross_site_ancestor"] if "has_cross_site_ancestor" in row.keys() else 1,
+                )
+            except ValueError:
+                stats["unsupported"] += 1
+                continue
             raw_value = row["value"]
             value = s(raw_value)
             blob = row["encrypted_value"]
             if not value and blob:
                 pt = decrypt_fn(bytes(blob), key)
+                if pt is not None:
+                    host_bytes = row["host_key"]
+                    if isinstance(host_bytes, str):
+                        host_bytes = host_bytes.encode("utf-8")
+                    pt = _strip_host_hash(pt, host_bytes, version)
                 if pt is None:
                     decrypt_fail += 1
+                    stats["failed"] += 1
                     continue
-                pt = _strip_host_hash(pt)
                 try:
                     value = pt.decode("utf-8")
                 except UnicodeDecodeError:
                     decrypt_fail += 1
+                    stats["failed"] += 1
                     continue
                 decoded += 1
-            elif not value and not blob:
-                continue
             # Map Chromium source_scheme (0=unset, 1=http, 2=https) to
             # Firefox schemeMap (0=unset, 1=http, 2=https, 4=file).
             src_scheme = row["source_scheme"] if "source_scheme" in row.keys() else 0
             scheme_map = src_scheme if src_scheme in (1, 2) else (2 if row["is_secure"] else 1)
 
             yield {
+                "partition_key": partition,
                 "host_key": s(row["host_key"]),
                 "name": s(row["name"]),
                 "value": value,
@@ -408,7 +456,7 @@ class CookiesImporter:
                 "last_access_us": _chrome_to_unix_us(row["last_access_utc"]),
                 "is_secure": row["is_secure"],
                 "is_httponly": row["is_httponly"],
-                "samesite": _SAMESITE_MAP.get(row["samesite"], 3),
+                "samesite": _SAMESITE_MAP.get(row["samesite"], 256),
                 "has_expires": row["has_expires"] if "has_expires" in row.keys() else 1,
                 "scheme_map": scheme_map,
             }
@@ -442,147 +490,128 @@ class CookiesImporter:
         return b"", _decrypt_v10_cbc, "unsupported_platform"
 
     def import_cookies(self) -> dict:
-        result = {"read": 0, "imported": 0, "merged": 0, "skipped": 0}
-
+        result = {"read": 0, "imported": 0, "merged": 0, "skipped": 0,
+                  "failed": 0, "unsupported": 0, "expired": 0, "decoded": 0,
+                  "session_cookies": 0, "profiles": []}
         if not self.zen_cookies.exists():
-            logger.error(f"Zen cookies.sqlite not found at {self.zen_cookies}")
-            result["error"] = "cookies_db_missing"
-            return result
-
+            return {**result, "error": "cookies_db_missing"}
+        with closing(sqlite3.connect(self.zen_cookies)) as target:
+            schema = target.execute("PRAGMA user_version").fetchone()[0]
+            columns = {r[1] for r in target.execute("PRAGMA table_info(moz_cookies)")}
+        required = {"originAttributes", "name", "value", "host", "path", "expiry",
+                    "lastAccessed", "creationTime", "isSecure", "isHttpOnly", "sameSite", "schemeMap"}
+        if not required <= columns or schema not in range(1, 18):
+            return {**result, "error": "unsupported_cookie_schema"}
+        dbs = self._injected_dbs if self._injected_dbs is not None else _cookie_dbs_default()
+        routes = self.cookie_routes
+        if routes is None:
+            # Standalone imports must use the same durable mapping as the app.
+            from migration_state import load_state
+            state = load_state(self.zen_profile)
+            routes = {}
+            for db in dbs:
+                profile = db.parent.parent if db.parent.name == "Network" else db.parent
+                cid = state["profiles"].get(f"arc:{profile.name}")
+                if cid:
+                    routes[db] = [cid]
+            if len(routes) != len(dbs) or self.container_ids:
+                return {**result, "error": "cookie_routes_required"}
+        if not routes:
+            return {**result, "error": "source_cookies_missing"}
+        if any(not p.is_file() or not ids or any(not isinstance(cid, int) or cid <= 0 for cid in ids)
+               for p, ids in routes.items()):
+            return {**result, "error": "cookie_routes_required"}
         key, decrypt_fn, err = self._resolve_key_and_decrypt_fn()
         if err:
-            result["error"] = err
-            return result
-
-        cookies: list[dict] = []
-        cookie_dbs = (
-            [p for p in self._injected_dbs if p.is_file()]
-            if self._injected_dbs is not None
-            else _cookie_dbs_default()
-        )
+            return {**result, "error": err}
+        cookies = []
+        now_us = int(time.time() * 1_000_000)
         try:
-            for db in cookie_dbs:
-                logger.info(f"📖 Reading cookies from {db.parent.name}")
+            for db, ids in routes.items():
+                profile = db.parent.parent if db.parent.name == "Network" else db.parent
+                stats = {"profile": profile.name, "read": 0, "decoded": 0,
+                         "failed": 0, "unsupported": 0, "expired": 0,
+                         "imported": 0, "merged": 0}
                 snap = self._snapshot(db)
-                conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
-                # encrypted_value is binary; some Chromium builds also stash
-                # bytes in TEXT columns. Tell sqlite3 not to UTF-8-decode anything,
-                # and we'll decode the str fields ourselves.
-                conn.text_factory = bytes
-                conn.row_factory = sqlite3.Row
-                try:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """SELECT host_key, name, value, encrypted_value, path,
-                                  expires_utc, creation_utc, last_access_utc,
-                                  is_secure, is_httponly, samesite,
-                                  has_expires, source_scheme
-                           FROM cookies"""
-                    )
-                    rows = cur.fetchall()
-                    result["read"] += len(rows)
-                    cookies.extend(self._decrypt_rows(rows, key, decrypt_fn))
-                finally:
-                    conn.close()
+                with closing(sqlite3.connect(f"file:{snap}?mode=ro", uri=True)) as source:
+                    source.text_factory = bytes
+                    source.row_factory = sqlite3.Row
+                    source_columns = {r[1].decode() for r in source.execute("PRAGMA table_info(cookies)")}
+                    has_meta = source.execute("SELECT 1 FROM sqlite_master WHERE name='meta'").fetchone()
+                    meta = source.execute("SELECT value FROM meta WHERE key='version'").fetchone() if has_meta else None
+                    version = int(meta[0]) if meta else 0
+                    fields = ["host_key", "name", "value", "encrypted_value", "path", "expires_utc",
+                              "creation_utc", "last_access_utc", "is_secure", "is_httponly", "samesite"]
+                    fields += [name if name in source_columns else f"{default} AS {name}"
+                               for name, default in (("has_expires", 1), ("source_scheme", 0),
+                                                     ("top_frame_site_key", "''"), ("has_cross_site_ancestor", 1))]
+                    rows = source.execute("SELECT " + ", ".join(fields) + " FROM cookies").fetchall()
+                    stats["read"] = len(rows)
+                    for cookie in self._decrypt_rows(rows, key, decrypt_fn, version, stats):
+                        stats["decoded"] += 1
+                        if cookie["partition_key"] and "isPartitionedAttributeSet" not in columns:
+                            stats["unsupported"] += 1
+                            continue
+                        if cookie["has_expires"] and cookie["expires_us"] <= now_us:
+                            stats["expired"] += 1
+                            continue
+                        cookies.append((cookie, sorted(set(ids)), stats))
+                result["profiles"].append(stats)
+                for name in ("read", "decoded", "failed", "unsupported", "expired"):
+                    result[name] += stats[name]
         finally:
             self._cleanup()
-
-        logger.info(f"🔍 Decoded {len(cookies)} of {result['read']} cookies from source browser")
+        result["skipped"] = result["failed"] + result["unsupported"] + result["expired"]
         if not cookies:
+            if result["failed"] or result["unsupported"]:
+                result["error"] = "cookie_decode_failed"
             return result
-
         if self.dry_run:
             result["dry_run"] = True
-            result["imported"] = len(cookies)
+            result["imported"] = sum(len(ids) for _, ids, _ in cookies)
             return result
-
-        backup = self.zen_cookies.with_name(f"{self.zen_cookies.name}.backup.{int(time.time())}")
-        shutil.copy2(self.zen_cookies, backup)
-        logger.info(f"💾 Backed up cookies.sqlite → {backup.name}")
-
-        conn = sqlite3.connect(self.zen_cookies, timeout=30.0)
-        try:
-            cur = conn.cursor()
-            cur.execute("BEGIN")
-            now_us = int(time.time() * 1_000_000)
-            now_ms = now_us // 1000
-            session_expiry_ms = now_ms + self.SESSION_COOKIE_DAYS * 86400 * 1000
-
-            # Targets: default context (empty) plus every container we were told about.
-            origin_targets = [""] + [f"^userContextId={cid}" for cid in self.container_ids]
-
-            for c in cookies:
-                # Modern Firefox stores `expiry` as MILLISECONDS since epoch
-                # (legacy was seconds; switched ~v108). Surviving native cookies
-                # in this profile confirmed the new format.
-                if not c["has_expires"] or not c["expires_us"]:
-                    expiry_ms = session_expiry_ms
-                else:
-                    expiry_ms = c["expires_us"] // 1000
-
-                host = c["host_key"]
-                last_accessed_us = c["last_access_us"] or now_us
-                creation_us = c["creation_us"] or now_us
-                for oa in origin_targets:
-                    try:
-                        cur.execute(
-                            """INSERT INTO moz_cookies
-                               (originAttributes, name, value, host, path, expiry,
-                                lastAccessed, creationTime, isSecure, isHttpOnly,
-                                sameSite, schemeMap, updateTime)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                oa,
-                                c["name"],
-                                c["value"],
-                                host,
-                                c["path"],
-                                expiry_ms,
-                                last_accessed_us,
-                                creation_us,
-                                int(bool(c["is_secure"])),
-                                int(bool(c["is_httponly"])),
-                                c["samesite"],
-                                c["scheme_map"],
-                                last_accessed_us,
-                            ),
-                        )
-                        result["imported"] += 1
-                    except sqlite3.IntegrityError:
-                        cur.execute(
-                            """UPDATE moz_cookies
-                                  SET value = ?, expiry = ?, lastAccessed = ?,
-                                      isSecure = ?, isHttpOnly = ?, sameSite = ?,
-                                      schemeMap = ?, updateTime = ?
-                               WHERE originAttributes = ? AND name = ?
-                                 AND host = ? AND path = ?""",
-                            (
-                                c["value"],
-                                expiry_ms,
-                                last_accessed_us,
-                                int(bool(c["is_secure"])),
-                                int(bool(c["is_httponly"])),
-                                c["samesite"],
-                                c["scheme_map"],
-                                last_accessed_us,
-                                oa,
-                                c["name"],
-                                host,
-                                c["path"],
-                            ),
-                        )
-                        result["merged"] += 1
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-        logger.info(
-            f"✅ Cookies: imported {result['imported']}, merged {result['merged']} "
-            f"across {len(origin_targets)} origin contexts"
-        )
+        # SQLite backup includes committed WAL contents.
+        with closing(sqlite3.connect(self.zen_cookies)) as source:
+            backup_path = self.zen_cookies.with_name(f"cookies.sqlite.backup.{time.time_ns()}")
+            with closing(sqlite3.connect(backup_path)) as backup:
+                source.backup(backup)
+        names = ["originAttributes", "name", "value", "host", "path", "expiry", "lastAccessed",
+                 "creationTime", "isSecure", "isHttpOnly", "sameSite", "schemeMap"]
+        if "updateTime" in columns:
+            names.append("updateTime")
+        if "isPartitionedAttributeSet" in columns:
+            names.append("isPartitionedAttributeSet")
+        placeholders = ",".join("?" for _ in names)
+        updates = ",".join(f"{name}=excluded.{name}" for name in names
+                           if name not in ("originAttributes", "name", "host", "path", "creationTime"))
+        with closing(sqlite3.connect(self.zen_cookies, timeout=30)) as target, target:
+            for cookie, ids, stats in cookies:
+                expiry_us = cookie["expires_us"]
+                if not cookie["has_expires"]:
+                    expiry_us = now_us + self.SESSION_COOKIE_DAYS * 86400 * 1_000_000
+                    result["session_cookies"] += 1
+                expiry = expiry_us // (1000 if schema >= 16 else 1_000_000)
+                for cid in ids:
+                    oa = f"^userContextId={cid}"
+                    if cookie["partition_key"]:
+                        oa += "&partitionKey=" + cookie["partition_key"]
+                    identity = (oa, cookie["name"], cookie["host_key"], cookie["path"])
+                    exists = target.execute("SELECT 1 FROM moz_cookies WHERE originAttributes=? AND name=? AND host=? AND path=?",
+                                            identity).fetchone()
+                    values = [oa, cookie["name"], cookie["value"], cookie["host_key"], cookie["path"], expiry,
+                              cookie["last_access_us"] or now_us, cookie["creation_us"] or now_us,
+                              int(bool(cookie["is_secure"])), int(bool(cookie["is_httponly"])),
+                              cookie["samesite"], cookie["scheme_map"]]
+                    if "updateTime" in columns:
+                        values.append(now_us)
+                    if "isPartitionedAttributeSet" in columns:
+                        values.append(int(bool(cookie["partition_key"])))
+                    target.execute(f"INSERT INTO moz_cookies ({','.join(names)}) VALUES ({placeholders}) "
+                                   f"ON CONFLICT(name,host,path,originAttributes) DO UPDATE SET {updates}", values)
+                    result["merged" if exists else "imported"] += 1
+                    stats["merged" if exists else "imported"] += 1
+        result["partial"] = bool(result["failed"] or result["unsupported"])
+        logger.info("Cookies: imported %s, merged %s; skipped %s", result["imported"], result["merged"], result["skipped"])
         return result
 
 
@@ -616,10 +645,8 @@ def main() -> int:
     parser.add_argument("--zen-profile", help="Zen profile name (partial match)")
     parser.add_argument(
         "--containers",
-        help="Comma-separated userContextIds to also populate (so cookies work "
-             "in container tabs). Pass 'auto' to read containers.json and use "
-             "every non-internal identity. Default: auto.",
-        default="auto",
+        help="Deprecated: explicit fan-out is rejected. Run the app to create profile mappings first.",
+        default="",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

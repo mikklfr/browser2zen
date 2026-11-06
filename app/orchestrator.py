@@ -35,6 +35,7 @@ from chromium_history_importer import HistoryImporter  # noqa: E402
 
 # Source-browser adapters.
 from extractors import ArcExtractor, BrowserExtractor  # noqa: E402
+from migration_state import container_for
 from zen_bookmark_importer import ZenBookmarkImporter  # noqa: E402
 from zen_favicon_importer import FaviconImporter, _iter_pinned_urls  # noqa: E402
 from zen_sessions_importer import ZenSessionsImporter  # noqa: E402
@@ -88,12 +89,14 @@ class MigrationOptions:
     include_open_tabs: bool = True
     include_history: bool = False
     include_cookies: bool = False
+    clear_before_import: bool = False
 
 
 # ----------- step ordering used in the GUI's progress list (left to right) ---
 
 GUI_STEPS = (
     "extract",
+    "clear",
     "containers",
     "sessions",
     "bookmarks",
@@ -107,6 +110,7 @@ GUI_STEPS = (
 # else is source-agnostic.
 STEP_LABELS = {
     "extract":    "Reading {source} data",
+    "clear":      "Backing up and clearing Zen import data",
     "containers": "Creating containers",
     "sessions":   "Importing spaces, pinned tabs, open tabs and folders",
     "bookmarks":  "Backing up as bookmarks",
@@ -160,7 +164,15 @@ _COOKIE_ERROR_MESSAGES = {
     "unsupported_platform":
         "Cookie import only supports macOS and Windows.",
     "cookies_db_missing":
-        "Zen cookies.sqlite was not found.",
+        "Zen cookies.sqlite was not found. Launch Zen once, then quit it and retry.",
+    "unsupported_cookie_schema":
+        "This Zen cookie database schema is unsupported; cookies were left unchanged.",
+    "cookie_routes_required":
+        "Source profiles could not be matched to destination containers. Run the app migration first.",
+    "source_cookies_missing":
+        "No cookie databases were found for the selected source profiles.",
+    "cookie_decode_failed":
+        "No usable cookies could be decoded. Check Keychain access and the source browser version.",
 }
 
 
@@ -169,6 +181,7 @@ _COOKIE_ERROR_MESSAGES = {
 class MigrationOrchestrator:
     def __init__(self, source: BrowserExtractor | None = None) -> None:
         self.bus = ProgressBus()
+        self.errors: list[str] = []
         # Default source = Arc so existing callers (CLI/Arc-only frontend)
         # don't need to change.
         self.source: BrowserExtractor = source or ArcExtractor()
@@ -306,6 +319,7 @@ class MigrationOrchestrator:
         Designed to be called on a worker thread; the JS bridge polls
         ``self.bus.drain()`` from its own thread.
         """
+        self.errors = []
         self.bus.install()
         try:
             yield from self._run(opts)
@@ -330,6 +344,7 @@ class MigrationOrchestrator:
         self._emit(ev)
 
     def _error_step(self, step: str, exc: BaseException) -> None:
+        self.errors.append(f"{_step_label(step, self.source.display_name)}: {exc}")
         self._emit({
             "kind": "step_error",
             "step": step,
@@ -339,6 +354,11 @@ class MigrationOrchestrator:
 
     def _run(self, opts: MigrationOptions) -> Iterator[ProgressEvent]:
         zen_profile = opts.zen_profile_path
+        from .env_check import is_zen_running
+        if not zen_profile.is_dir() or is_zen_running():
+            self._error_step("extract", RuntimeError("Select an existing Zen profile and quit Zen before migrating."))
+            yield from self._drain_yield()
+            return
 
         # 1: extract -----------------------------------------------------
         self._start_step("extract")
@@ -385,9 +405,28 @@ class MigrationOrchestrator:
         }, message=f"Read {space_count} {self.source.display_name} spaces")
         yield from self._drain_yield()
 
+        if opts.clear_before_import:
+            self._start_step("clear")
+            try:
+                from zen_fresh_import import clear_for_import
+
+                from .env_check import is_zen_running
+                if not export.spaces:
+                    raise RuntimeError("No source spaces to import; Zen was not cleared.")
+                if is_zen_running():
+                    raise RuntimeError("Quit Zen before clearing its import data.")
+                archive = clear_for_import(zen_profile)
+                self._done_step("clear", summary={"backup": str(archive)},
+                                message=f"Cleared Zen import data. Backup: {archive}")
+            except Exception as exc:
+                self._error_step("clear", exc)
+                yield from self._drain_yield()
+                return
+            yield from self._drain_yield()
+
         # 2: containers --------------------------------------------------
         container_mappings: dict = {}
-        if opts.include_workspaces:
+        if opts.include_workspaces or opts.include_pinned_tabs or opts.include_cookies:
             self._start_step("containers")
             try:
                 src_zen = _SrcZenProfile(name=zen_profile.name, path=zen_profile)
@@ -395,9 +434,15 @@ class MigrationOrchestrator:
                 container_mappings = space_importer.import_spaces_as_containers(
                     export_data, dry_run=False
                 ) or {}
-                self._done_step("containers", summary={"created_or_reused": len(container_mappings)})
+                if not container_mappings:
+                    raise RuntimeError(
+                        "Could not create profile containers; migration stopped to preserve account isolation."
+                    )
+                self._done_step("containers", summary={"created_or_reused": len(set(container_mappings.values()))})
             except Exception as exc:
                 self._error_step("containers", exc)
+                yield from self._drain_yield()
+                return
             yield from self._drain_yield()
 
         # 3: sessions / pinned tabs / folders ----------------------------
@@ -420,6 +465,8 @@ class MigrationOrchestrator:
 
                 sess = ZenSessionsImporter(zen_profile, folders_collapsed=opts.folders_collapsed)
                 ok = sess.import_data(payload, container_mappings, dry_run=False)
+                if not ok:
+                    raise RuntimeError("Could not import or repair workspace sessions; see the migration log.")
                 pinned_total = sum(len(sp.get("pinned_tabs") or [])
                                    for sp in payload.get("spaces", []))
                 open_total = sum(len(sp.get("open_tabs") or [])
@@ -437,6 +484,8 @@ class MigrationOrchestrator:
             try:
                 bm = ZenBookmarkImporter(zen_profile)
                 ok = bm.import_bookmarks(export_data, dry_run=False)
+                if not ok:
+                    raise RuntimeError("Could not back up or import bookmarks; see the migration log.")
                 self._done_step("bookmarks", summary={"ok": bool(ok)})
             except Exception as exc:
                 self._error_step("bookmarks", exc)
@@ -521,6 +570,7 @@ class MigrationOrchestrator:
                         keychain_service=getattr(self.source, "keychain_service", "Arc Safe Storage"),
                         keychain_account=getattr(self.source, "keychain_account", "Arc"),
                         local_state_paths=self.source.local_state_paths(),
+                        cookie_routes=self._cookie_routes(export_data, container_mappings),
                     )
                 summary = c.import_cookies()
                 if summary.get("error"):
@@ -531,6 +581,15 @@ class MigrationOrchestrator:
                     self._error_step("cookies", RuntimeError(msg))
                 else:
                     self._done_step("cookies", summary=summary)
+                    if summary.get("partial"):
+                        issues = []
+                        if summary["failed"]:
+                            issues.append(f"{summary['failed']} cookies could not be decrypted")
+                        if summary["unsupported"]:
+                            issues.append(f"{summary['unsupported']} cookies had unsupported partition scopes")
+                        self._error_step("cookies", RuntimeError(
+                            "Imported some cookies, but " + "; ".join(issues) + ". Some sites need login."
+                        ))
             except Exception as exc:
                 self._error_step("cookies", exc)
             yield from self._drain_yield()
@@ -538,13 +597,35 @@ class MigrationOrchestrator:
         # 9: finalize ----------------------------------------------------
         self._start_step("finalize")
         try:
-            (zen_profile / ".browser2zen-migrated").write_text(
-                json.dumps({"ts": time.time(), "version": 1}), encoding="utf-8"
-            )
+            if not self.errors:
+                (zen_profile / ".browser2zen-migrated").write_text(
+                    json.dumps({"ts": time.time(), "version": 1}), encoding="utf-8"
+                )
         except Exception:
             pass
-        self._done_step("finalize", message="Migration complete")
+        self._done_step("finalize", message="Migration needs attention" if self.errors else "Migration complete")
         yield from self._drain_yield()
+
+    def _cookie_routes(self, export_data: dict, mappings: dict) -> dict[Path, list[int]]:
+        by_profile = {}
+        for db in self.source.cookie_db_paths():
+            profile = db.parent.parent if db.parent.name == "Network" else db.parent
+            by_profile[profile.name] = db
+        routes: dict[Path, list[int]] = {}
+        for space in export_data["spaces"]:
+            profile = space.get("source_profile")
+            # Dia's live API exposes spaces, not the Chromium profile.
+            if not profile and len(by_profile) == 1 and self.source.name != "arc":
+                profile = next(iter(by_profile))
+            if profile not in by_profile:
+                raise RuntimeError(f"No cookie database found for source profile {profile!r}; cookies were not mixed.")
+            cid = container_for(mappings, space)
+            if not cid:
+                raise RuntimeError("Missing destination profile container; cookies were not imported.")
+            ids = routes.setdefault(by_profile[profile], [])
+            if cid not in ids:
+                ids.append(cid)
+        return routes
 
     def _drain_yield(self) -> Iterator[ProgressEvent]:
         yield from self.bus.drain()
@@ -558,6 +639,7 @@ class MigrationOrchestrator:
             return []
         out: list[Path] = []
         out.extend(sorted(zen_profile.glob("*.backup.*")))
+        out.extend(sorted(zen_profile.glob("before-import-*.zenbackup")))
         return out
 
 

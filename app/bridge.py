@@ -141,12 +141,15 @@ class Bridge:
         for f in profile.glob("*.backup.*"):
             try:
                 ts = int(f.name.rsplit(".backup.", 1)[1])
+                if ts >= 1_000_000_000_000_000:
+                    ts /= 1_000_000_000
             except (ValueError, IndexError):
                 continue
             original = f.name.split(".backup.")[0]
             try:
                 size = f.stat().st_size
-            except OSError:
+                iso = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, ValueError, OverflowError):
                 continue
             items.append({
                 "path": str(f),
@@ -154,7 +157,7 @@ class Bridge:
                 "original": original,
                 "ts": ts,
                 "size": size,
-                "iso": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                "iso": iso,
             })
         items.sort(key=lambda x: x["ts"], reverse=True)
         return items
@@ -334,6 +337,7 @@ class Bridge:
                 with self._lock:
                     self._final_state = {
                         "status": "done",
+                        "errors": list(self.orchestrator.errors),
                         "backups": [str(p) for p in self.orchestrator.find_backups(opts.zen_profile_path)],
                         "zenProfilePath": str(opts.zen_profile_path),
                     }
@@ -627,4 +631,5 @@ class Bridge:
             include_open_tabs=bool(data.get("includeOpenTabs", False)),
             include_history=bool(data.get("includeHistory", False)),
             include_cookies=bool(data.get("includeCookies", False)),
+            clear_before_import=bool(data.get("clearBeforeImport", False)),
         )

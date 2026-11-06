@@ -598,6 +598,8 @@ body[data-platform="mac"] main {
   user-select: none;
 }
 .toggle:hover { border-color: var(--bd-medium); }
+.toggle[data-key="clearBeforeImport"] { grid-column: 1 / -1; }
+.toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .toggle .label-stack { display: flex; flex-direction: column; gap: 2px; }
 .toggle .lbl { font-weight: var(--fw-medium); }
 .toggle .desc { font-size: var(--fs-tiny); color: var(--text-tertiary); }

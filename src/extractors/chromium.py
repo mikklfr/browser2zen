@@ -534,6 +534,7 @@ class ChromiumExtractor(BrowserExtractor):
             spaces.append(SpaceRecord(
                 space_id=space_id,
                 space_name=self._profile_display_name(profile),
+                source_profile=profile.name,
                 pinned_tabs=pinned_tabs,
                 open_tabs=open_tabs,
                 folders=[],

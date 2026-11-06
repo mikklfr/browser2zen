@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,20 +115,12 @@ class ZenBookmarkImporter:
 
     def backup_database(self) -> bool:
         """Create backup of Zen database before import."""
-        import os
-        import shutil
-
-        # Create backups directory if it doesn't exist
-        backups_dir = Path(os.getcwd()) / "backups"
-        backups_dir.mkdir(exist_ok=True)
-
-        # Create backup in backups directory
-        backup_filename = f"zen_database_backup_{int(time.time())}.sqlite"
-        backup_path = backups_dir / backup_filename
-
+        backup_path = self.places_db.with_name(f"places.sqlite.backup.{time.time_ns()}")
         try:
-            shutil.copy2(self.places_db, backup_path)
-            logger.info(f"✅ Database backed up to: backups/{backup_path.name}")
+            with closing(sqlite3.connect(f"file:{self.places_db}?mode=ro", uri=True)) as source:
+                with closing(sqlite3.connect(backup_path)) as target:
+                    source.backup(target)
+            logger.info(f"✅ Database backed up to: {backup_path}")
             return True
         except Exception as e:
             logger.error(f"❌ Failed to backup database: {e}")

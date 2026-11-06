@@ -71,6 +71,8 @@ local/
 
 # Local configuration files
 .claude/settings.local.json
+.codegraph/
+*.zenbackup
 
 # Test files
 test_generic.py

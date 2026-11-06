@@ -35,7 +35,7 @@ BrowserExtractor.extract() → ExportData → to_legacy_dict()
               ├─── ZenBookmarkImporter   → places.sqlite (moz_bookmarks)
               ├─── FaviconImporter       → favicons.sqlite + inline data URIs
               ├─── HistoryImporter       → places.sqlite (moz_places, moz_historyvisits)
-              └─── CookiesImporter       → cookies.sqlite (incl. per-container dupes)
+              └─── CookiesImporter       → cookies.sqlite (explicit source-profile routes)
 ```
 
 ### Source extractors (`src/extractors/`)
@@ -84,11 +84,15 @@ heavy ones reverse-engineer Firefox internals:
 - **Pinned-tab favicons** are read from each tab's inline `image` data
   URI inside `zen-sessions.jsonlz4`, not from `favicons.sqlite`.
   Writing only the SQLite store leaves the sidebar blank.
-- **`moz_cookies.expiry`** switched from seconds to milliseconds around
-  Firefox 108. Storing seconds makes Firefox treat every cookie as
-  expired in 1970 and purge them all on next startup.
-- **Container cookies** need `^userContextId=N` duplicates per
-  container so cookies are visible to per-space tabs.
+- **`moz_cookies.expiry`** uses milliseconds starting at schema 16;
+  schema 17 adds `updateTime` in microseconds. The Chromium writer checks
+  the target schema and columns before writing.
+- **Profile identity** survives in `source_profile`. One Arc profile maps
+  to one Zen container shared by its spaces. Workspace `containerTabId`
+  and every tab's `userContextId` agree. Chromium cookie routes retain
+  source DB provenance; never pool profiles or copy to every container.
+  `migration_state.py` stores durable mappings in
+  `.browser2zen-identities.json`, included in workspace backups.
 
 ### Backup/restore (`src/zen_backup.py`)
 

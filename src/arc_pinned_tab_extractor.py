@@ -68,6 +68,7 @@ class ArcSpace:
     open_tabs: list[ArcOpenTab]
     icon: str | None = None
     color: dict | None = None
+    source_profile: str = "Default"
 
     def __str__(self):
         icon_str = f" ({self.icon})" if self.icon else ""
@@ -433,7 +434,7 @@ class ArcPinnedTabExtractor:
 
                         logger.info(f"  ✅ {space_name}: {len(pinned_tabs)} pinned tabs, {len(open_tabs)} open tabs, {len(folders)} folders")
                         space_color = space_info.get('color')
-                        arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, open_tabs, space_icon, space_color))
+                        arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, open_tabs, space_icon, space_color, space_info.get("profile", "Default")))
             else:
                 # Fallback to original method if sidebar spaces not found
                 for space_id, space_info in spaces_info.items():
@@ -448,7 +449,7 @@ class ArcPinnedTabExtractor:
                     folders.sort(key=lambda folder: folder.index)
                     logger.info(f"  ✅ {space_name}: {len(pinned_tabs)} pinned tabs, {len(open_tabs)} open tabs, {len(folders)} folders")
                     space_color = space_info.get('color')
-                    arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, open_tabs, space_icon, space_color))
+                    arc_spaces.append(ArcSpace(space_id, space_name, pinned_tabs, folders, open_tabs, space_icon, space_color, space_info.get("profile", "Default")))
 
         # Extract Essential tabs and distribute them to their appropriate workspaces
         essential_tabs_by_space = self._extract_essential_tabs_distributed(data, spaces_info)
@@ -906,6 +907,7 @@ class ArcPinnedTabExtractor:
                         # Update icon and color on the extracted space
                         arc_space.icon = icon
                         arc_space.color = color
+                        arc_space.source_profile = self._space_attributes(space_data)["profile"] or "Default"
                         if arc_space.pinned_tabs:
                             arc_spaces.append(arc_space)
                 i += 2

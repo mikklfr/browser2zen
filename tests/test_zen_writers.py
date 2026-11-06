@@ -29,7 +29,7 @@ def test_zen_space_importer_creates_container(arc_home, zen_profile):
 
     containers = json.loads((zen_profile / "containers.json").read_text())
     names = {idn["name"] for idn in containers["identities"] if "name" in idn}
-    assert "Test Space" in names
+    assert "Arc · Default" in names
 
 
 def test_zen_bookmark_importer_writes_bookmarks(arc_home, zen_profile):
@@ -99,3 +99,26 @@ def test_zen_sessions_importer_writes_session(arc_home, zen_profile):
     blob = out.read_bytes()
     # mozLz4 magic header
     assert blob.startswith(b"mozLz40\0")
+
+
+def test_bookmark_backup_ignores_readonly_launch_directory(arc_home, zen_profile, monkeypatch):
+    import errno
+    from pathlib import Path
+
+    from zen_bookmark_importer import ZenBookmarkImporter
+
+    legacy = _legacy_dict_from_arc()
+    monkeypatch.chdir("/")
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if path == Path("/backups"):
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    assert ZenBookmarkImporter(zen_profile).import_bookmarks(legacy)
+    backups = list(zen_profile.glob("places.sqlite.backup.*"))
+    assert backups
+    with sqlite3.connect(backups[0]) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)

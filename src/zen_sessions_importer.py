@@ -27,6 +27,8 @@ except ImportError:
         "Install it with: pip install lz4"
     )
 
+from migration_state import backup_file, container_for, load_state, save_state, space_key
+
 logger = logging.getLogger(__name__)
 
 MOZLZ4_MAGIC = b'mozLz40\0'
@@ -48,10 +50,12 @@ def write_mozlz4(file_path: Path, data: dict) -> None:
     """Serialize JSON data and write as mozlz4 file."""
     json_bytes = json.dumps(data, separators=(',', ':')).encode('utf-8')
     compressed = lz4.block.compress(json_bytes, store_size=False)
-    with open(file_path, 'wb') as f:
+    temporary = file_path.with_name(file_path.name + ".tmp")
+    with open(temporary, 'wb') as f:
         f.write(MOZLZ4_MAGIC)
         f.write(struct.pack('<I', len(json_bytes)))
         f.write(compressed)
+    temporary.replace(file_path)
 
 
 class ZenSessionsImporter:
@@ -95,7 +99,7 @@ class ZenSessionsImporter:
             try:
                 return read_mozlz4(self.sessions_file)
             except Exception as e:
-                logger.warning(f"Could not read existing zen-sessions.jsonlz4: {e}")
+                raise ValueError("Cannot read existing Zen sessions; restore a backup before importing.") from e
 
         return {
             "spaces": [],
@@ -233,12 +237,11 @@ class ZenSessionsImporter:
         """Process a single Arc space into Zen space, folders, and tabs
         (pinned + open).
 
-        ``user_context_id`` scopes the open tabs' cookies to the per-space
-        container; pinned tabs are bound through the workspace's
-        ``containerTabId`` instead. Returns (space_dict, folders_list,
-        tabs_list).
+        Every tab and its workspace use the same source profile container.
+        Returns (space_dict, folders_list, tabs_list).
         """
         space = self._build_space(space_data)
+        space["containerTabId"] = user_context_id
         workspace_uuid = space["uuid"]
 
         # Build folders with hierarchy
@@ -299,6 +302,8 @@ class ZenSessionsImporter:
                 tab_data, workspace_uuid,
                 index=i + 1, folder_id=folder_id,
             )
+            zen_tab["userContextId"] = user_context_id
+            zen_tab["zenDefaultUserContextId"] = user_context_id
             zen_tabs.append(zen_tab)
 
         # Open (non-pinned) tabs from Arc become open tabs in the Zen
@@ -326,7 +331,7 @@ class ZenSessionsImporter:
                 "pinned": True,
                 "hidden": False,
                 "groupId": folder["id"],
-                "zenWorkspace": None,
+                "zenWorkspace": workspace_uuid,
                 "zenSyncId": placeholder_sync_id,
                 "zenEssential": False,
                 "zenDefaultUserContextId": None,
@@ -343,29 +348,39 @@ class ZenSessionsImporter:
             zen_tabs.append(placeholder)
             folder["emptyTabIds"] = [placeholder_sync_id]
 
+        for tab in zen_tabs:
+            tab["userContextId"] = user_context_id
+            tab["zenDefaultUserContextId"] = user_context_id
         return space, zen_folders, zen_tabs
 
     def _merge_with_existing(self, existing: dict, new_spaces: list[dict],
                              new_tabs: list[dict], new_folders: list[dict]) -> dict:
         """Merge imported data with existing zen-sessions data."""
-        existing_space_names = {s["name"] for s in existing.get("spaces", [])}
-
-        spaces_to_add = []
-        skipped_space_uuids = set()
-        for space in new_spaces:
-            if space["name"] in existing_space_names:
-                logger.info(f"  Skipping existing space: {space['name']}")
-                skipped_space_uuids.add(space["uuid"])
-            else:
-                spaces_to_add.append(space)
-
-        # Filter out tabs/folders belonging to skipped spaces
-        tabs_to_add = [t for t in new_tabs if t["zenWorkspace"] not in skipped_space_uuids]
-        folders_to_add = [f for f in new_folders if f["workspaceId"] not in skipped_space_uuids]
-
+        existing_ids = {s["uuid"] for s in existing.get("spaces", [])}
+        repairs = {s["uuid"]: s for s in new_spaces if s["uuid"] in existing_ids}
+        spaces_to_add = [s for s in new_spaces if s["uuid"] not in existing_ids]
+        tabs_to_add = [t for t in new_tabs if t["zenWorkspace"] not in repairs]
+        folders_to_add = [f for f in new_folders if f["workspaceId"] not in repairs]
+        folder_workspaces = {f["id"]: f.get("workspaceId") for f in existing.get("folders", [])}
+        old_tabs = []
+        for tab in existing.get("tabs", []):
+            tab = dict(tab)
+            workspace = tab.get("zenWorkspace") or folder_workspaces.get(tab.get("groupId"))
+            if workspace in repairs:
+                cid = repairs[workspace]["containerTabId"]
+                if tab.get("userContextId", 0) != cid:
+                    tab.pop("storage", None)
+                tab["userContextId"] = cid
+                tab["zenDefaultUserContextId"] = cid
+            old_tabs.append(tab)
+        old_spaces = [
+            {**s, "name": repairs[s["uuid"]]["name"],
+             "containerTabId": repairs[s["uuid"]]["containerTabId"]}
+            if s["uuid"] in repairs else s for s in existing.get("spaces", [])
+        ]
         merged = dict(existing)
-        merged["spaces"] = existing.get("spaces", []) + spaces_to_add
-        merged["tabs"] = existing.get("tabs", []) + tabs_to_add
+        merged["spaces"] = old_spaces + spaces_to_add
+        merged["tabs"] = old_tabs + tabs_to_add
         merged["folders"] = existing.get("folders", []) + folders_to_add
         merged["splitViewData"] = existing.get("splitViewData", [])
         merged["lastCollected"] = int(time.time() * 1000)
@@ -437,7 +452,9 @@ class ZenSessionsImporter:
             for win_list_key in ("windows", "_closedWindows"):
                 for win in ss_data.get(win_list_key, []):
                     # Replace pinned tabs with zen-sessions tabs (ensures consistent zenSyncId + groupId)
-                    unpinned = [t for t in win.get("tabs", []) if not t.get("pinned")]
+                    sync_ids = {t.get("zenSyncId") for t in merged.get("tabs", []) if t.get("zenSyncId")}
+                    unpinned = [t for t in win.get("tabs", []) if not t.get("pinned")
+                                and t.get("zenSyncId") not in sync_ids]
                     win["tabs"] = list(merged.get("tabs", [])) + unpinned
 
                     # Replace groups with folder groups
@@ -452,6 +469,7 @@ class ZenSessionsImporter:
 
             if updated:
                 try:
+                    backup_file(ss_path)
                     write_mozlz4(ss_path, ss_data)
                     logger.info(f"  Synced {len(merged['tabs'])} tabs + {len(folder_groups)} groups to {ss_path.name}")
                 except Exception as e:
@@ -465,7 +483,7 @@ class ZenSessionsImporter:
 
         Args:
             export_data: Parsed Arc export JSON with 'spaces' array.
-            container_mappings: Dict mapping space_name -> container userContextId.
+            container_mappings: Dict mapping source space_id -> container userContextId.
             dry_run: If True, log what would happen without writing.
 
         Returns:
@@ -474,17 +492,43 @@ class ZenSessionsImporter:
         try:
             logger.info("Importing Arc data into zen-sessions.jsonlz4...")
 
+            existing = self._read_existing()
+            state = load_state(self.zen_profile)
+            source = export_data.get("source", "arc")
+            guide_path = self.zen_profile / "workspace_setup_guide.json"
+            guide = json.loads(guide_path.read_text()) if guide_path.exists() else {}
+            legacy_names = guide.get("zen_workspace_setup_guide", {}).get("container_mappings", {})
             all_new_spaces = []
             all_new_tabs = []
             all_new_folders = []
 
             for space_data in export_data.get("spaces", []):
                 space_name = space_data["space_name"]
-                container_id = int(container_mappings.get(space_name, 0) or 0)
+                container_id = container_for(container_mappings, space_data)
 
                 space, folders, tabs = self._process_space(
                     space_data, user_context_id=container_id,
                 )
+                key = space_key(source, space_data)
+                target_uuid = state["spaces"].get(key)
+                if target_uuid is None and space_name in legacy_names:
+                    candidates = [s for s in existing.get("spaces", []) if s["name"] == space_name]
+                    urls = {t["entries"][0]["url"] for t in tabs if not t.get("zenIsEmpty")}
+                    if len(candidates) == 1:
+                        candidate = candidates[0]
+                        old_urls = {t.get("entries", [{}])[0].get("url")
+                                    for t in existing.get("tabs", [])
+                                    if t.get("zenWorkspace") == candidate["uuid"]}
+                        if urls and urls <= old_urls and candidate["uuid"] not in state["spaces"].values():
+                            target_uuid = candidate["uuid"]
+                            logger.info("Repairing earlier imported workspace: %s", space_name)
+                if target_uuid:
+                    space["uuid"] = target_uuid
+                    for tab in tabs:
+                        tab["zenWorkspace"] = target_uuid
+                    for folder in folders:
+                        folder["workspaceId"] = target_uuid
+                state["spaces"][key] = space["uuid"]
                 all_new_spaces.append(space)
                 all_new_folders.extend(folders)
                 all_new_tabs.extend(tabs)
@@ -506,16 +550,23 @@ class ZenSessionsImporter:
 
             # Backup existing file
             if not self._backup_sessions():
-                logger.warning("Could not backup zen-sessions.jsonlz4, continuing anyway...")
+                raise OSError("Could not back up zen-sessions.jsonlz4")
 
             # Read existing and merge
-            existing = self._read_existing()
             merged = self._merge_with_existing(
                 existing, all_new_spaces, all_new_tabs, all_new_folders
             )
 
             # Write
             write_mozlz4(self.sessions_file, merged)
+
+            save_state(self.zen_profile, state)
+            if all_new_spaces:
+                from zen_space_importer import ZenProfile, ZenSpaceImporter
+                if not ZenSpaceImporter(ZenProfile(self.zen_profile.name, self.zen_profile)).update_prefs_for_workspaces(
+                    all_new_spaces[0]["uuid"]
+                ):
+                    raise OSError("Cannot update active workspace preference")
 
             # Sync folder groups to sessionstore so Firefox creates tab-group DOM elements
             self._sync_sessionstore(merged)

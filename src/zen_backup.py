@@ -53,10 +53,13 @@ ARCHIVE_FORMAT_VERSION = 1
 # below). Directories under ``extensions`` recurse.
 CATEGORY_FILES: dict[str, tuple[str, ...]] = {
     "workspaces": (
+        ".browser2zen-identities.json",
+        ".browser2zen-migrated",
+        "workspace_setup_guide.json",
         "containers.json",
         "zen-sessions.jsonlz4",
         "sessionstore.jsonlz4",
-        "sessionstore-backups/recovery.jsonlz4",
+        "sessionstore-backups",
     ),
     "browsing": (
         "places.sqlite",
@@ -362,6 +365,13 @@ class ZenBackupImporter:
 
         try:
             with tarfile.open(self.archive_path, "r:gz") as tar:
+                # Legacy backups have no mapping manifest. A mapping from the
+                # newer profile must not survive restoration of older sessions.
+                mapping = self.target / ".browser2zen-identities.json"
+                inventory = {m.name for m in tar.getmembers()}
+                if "workspaces" in active and "profile/.browser2zen-identities.json" not in inventory:
+                    self._snapshot_existing(mapping)
+                    mapping.unlink(missing_ok=True)
                 for member in tar.getmembers():
                     if member.name == "manifest.json":
                         continue
