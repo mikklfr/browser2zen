@@ -180,6 +180,17 @@ Zen is running.
 
 ## Run from source
 
+On macOS, with Python 3 installed:
+
+```bash
+./run.sh
+./run.sh --debug
+```
+
+The script creates a local `.venv`, installs the declared dependencies,
+and launches the app. It works from any current directory and forwards
+arguments to the app.
+
 For Linux, Intel Mac, contributors, or anyone who'd rather skip the DMG:
 
 ```bash
